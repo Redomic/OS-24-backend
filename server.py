@@ -1,13 +1,21 @@
 import os
+from pathlib import Path
 from datetime import datetime
 from collections import deque
 import base64
 import traceback
 import copy
 import threading
+from multiprocessing import Process
+import webbrowser
+import time
+import atexit
+import signal
 
 from dotenv import load_dotenv
 import boto3
+
+import torch
 
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
@@ -15,6 +23,9 @@ from flask_cors import CORS
 
 import cv2
 import numpy as np
+
+from strongsort.strong_sort import StrongSORT
+from strongsort.utils.parser import YamlParser
 
 from shapely.geometry import Polygon, Point
 
@@ -25,6 +36,23 @@ from ultralytics.utils.plotting import Annotator, colors
 from db import create_region, update_log_event, update_density_event, get_regions, get_logs, get_active_log, get_active_density_event, get_region_count
 
 load_dotenv('./.env')
+
+device = torch.device("mps" if torch.mps.is_available() else "cpu")
+
+reid_weights = Path("./weights/osnet_x0_25_msmt17.pt")
+tracker_config = "./strongsort/configs/strongsort.yaml"
+cfg = YamlParser()
+cfg.merge_from_file(tracker_config)
+tracker = StrongSORT(reid_weights,
+                     device,
+                     False,
+                     max_dist=cfg.strongsort.max_dist,
+                     max_iou_dist=cfg.strongsort.max_iou_dist,
+                     max_age=cfg.strongsort.max_age,
+                     max_unmatched_preds=cfg.strongsort.max_unmatched_preds,
+                     n_init=cfg.strongsort.n_init,
+                     nn_budget=cfg.strongsort.nn_budget
+)
 
 s3_client = boto3.client(
     's3',
@@ -154,6 +182,10 @@ def process_and_stream(video_stream_url, zones):
 
     frame_counter = 0
 
+    # Warm up the tracker model if needed
+    if hasattr(tracker.model, 'warmup'):
+        tracker.model.warmup()
+
     while videocapture.isOpened() and not stop_event.is_set():
         success, frame = videocapture.read()
         if not success:
@@ -169,26 +201,48 @@ def process_and_stream(video_stream_url, zones):
             os.makedirs(os.path.dirname(save_path), exist_ok=True) 
             cv2.imwrite(save_path, frame) 
 
-        results = model.track(frame, persist=True, classes=classes, tracker="botsort.yaml")
+        # Run YOLO detection
+        results = model(frame, classes=classes)
+        
         frame_time = datetime.now()
 
-        if results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu()
-            ids = results[0].boxes.id.cpu().tolist()
-            clss = results[0].boxes.cls.cpu().tolist()
+        # Process detections with StrongSORT
+        if len(results[0].boxes) > 0:
+            detections = results[0].boxes.xyxy.cpu().numpy()
+            confidences = results[0].boxes.conf.cpu().numpy()
+            classes = results[0].boxes.cls.cpu().numpy()
+            
+            # Filter for person class (usually class 0)
+            mask = classes == 0
+            detections = detections[mask]
+            confidences = confidences[mask]
+            classes = classes[mask]
+            
+            # Combine detections, confidences, and classes into a single array
+            dets = np.hstack((detections, confidences[:, np.newaxis], classes[:, np.newaxis]))
+            
+            # Update tracker
+            tracks = tracker.update(dets, frame)
+            
             annotator = Annotator(frame, line_width=line_thickness, example=str(names))
+            response["footfall_summary"]["total_footfall"] = len(tracks)
 
-            response["footfall_summary"]["total_footfall"] = len(ids)
-
-            for box, cls, obj_id in zip(boxes, clss, ids):
-                if cls == 0:
-                    annotator.box_label(box, str(int(obj_id)), color=colors(cls, True))
+            # Process each track
+            for track in tracks:
+                box = track[:4]  # First 4 elements are bounding box coordinates
+                obj_id = int(track[4])  # Track ID
+                cls = int(track[5])  # Class ID
+                
+                if cls == 0:  # If person class
+                    annotator.box_label(box, str(obj_id), color=colors(cls, True))
                     bbox_center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
+                    # Track object paths
                     if obj_id not in object_paths:
                         object_paths[obj_id] = []
                     object_paths[obj_id].append(bbox_center)
 
+                    # Process regions
                     for i, region in enumerate(regions):
                         region_color = (0, 0, 255)
                         cv2.rectangle(
@@ -199,7 +253,7 @@ def process_and_stream(video_stream_url, zones):
                             thickness=region_thickness
                         )
 
-                        point = Point(bbox_center[0], bbox_center[1])  # Create a point for the object's center
+                        point = Point(bbox_center[0], bbox_center[1])
                         polygon = Polygon([
                             (region["x_min"], region["y_min"]),
                             (region["x_max"], region["y_min"]),
