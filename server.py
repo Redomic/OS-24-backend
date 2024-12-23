@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from datetime import datetime
+import time
 from collections import deque
 import base64
 import traceback
@@ -294,6 +295,8 @@ def process_and_stream(video_stream_url, zones):
         if stop_event.is_set():
             print("Stopping processing")
             break
+
+        time.sleep(0.2)
     
     videocapture.release()
 
