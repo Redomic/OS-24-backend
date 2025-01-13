@@ -3,7 +3,7 @@ from datetime import datetime
 
 def dict_factory(cursor, row):
     d = {}
-    for idx,col in enumerate(cursor.description):
+    for idx, col in enumerate(cursor.description):
         d[col[0]] = row[idx]
     return d
 
@@ -11,15 +11,26 @@ db = sqlite3.connect(":memory:", check_same_thread=False)
 db.row_factory = dict_factory
 cursor = db.cursor()
 
+# Streams Table
+cursor.execute("""
+CREATE TABLE streams (
+    stream_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    footfall INTEGER,
+    name TEXT
+)
+""")
+
 # Regions Table
 cursor.execute("""
 CREATE TABLE regions (
     region_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stream_id INTEGER,
     name TEXT,
     x_min INTEGER,
     y_min INTEGER,
     x_max INTEGER,
-    y_max INTEGER
+    y_max INTEGER,
+    FOREIGN KEY (stream_id) REFERENCES streams(stream_id)
 )
 """)
 
@@ -36,6 +47,7 @@ CREATE TABLE logs (
 )
 """)
 
+# Density Events Table
 cursor.execute("""
 CREATE TABLE density_event (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,18 +61,48 @@ CREATE TABLE density_event (
 
 db.commit()
 
-def create_region(region_name, x_min, y_min, x_max, y_max):
+def create_stream(stream_name):
     cursor.execute("""
-    INSERT INTO regions (name, x_min, y_min, x_max, y_max)
-    VALUES (?, ?, ?, ?, ?)
-    """, (region_name, x_min, y_min, x_max, y_max))
+    INSERT INTO streams (name)
+    VALUES (?)
+    """, (stream_name,))
     db.commit()
-    print(f"Region created: {region_name}, Coordinates: ({x_min}, {y_min}, {x_max}, {y_max})")
+    print(f"Stream created: {stream_name}")
 
-def get_regions():
-    cursor.execute("""SELECT * FROM regions""")
-    regions = cursor.fetchall()
-    return regions
+def create_region(stream_id, region_name, x_min, y_min, x_max, y_max):
+    cursor.execute("""
+    SELECT * FROM streams WHERE stream_id = ?
+    """, (stream_id,))
+    stream = cursor.fetchone()
+
+    if not stream:
+        print(f"Stream '{stream_id}' not found.")
+        return
+
+    cursor.execute("""
+    INSERT INTO regions (stream_id, name, x_min, y_min, x_max, y_max)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (stream_id, region_name, x_min, y_min, x_max, y_max))
+    db.commit()
+    print(f"Region created under stream '{stream["name"]}': {region_name}, Coordinates: ({x_min}, {y_min}, {x_max}, {y_max})")
+
+def get_stream(stream_name):
+    cursor.execute("""
+    SELECT stream_id FROM streams WHERE name = ?
+    """, (stream_name,))
+    return cursor.fetchone()
+
+def get_streams():
+    cursor.execute("SELECT * FROM streams")
+    return cursor.fetchall()
+
+def get_regions(stream_name):
+    cursor.execute("""
+    SELECT regions.* FROM regions
+    JOIN streams ON regions.stream_id = streams.stream_id
+    WHERE streams.name = ?
+    """, (stream_name,))
+    return cursor.fetchall()
 
 def get_region_count(region_name):
     cursor.execute("""
@@ -69,7 +111,7 @@ def get_region_count(region_name):
     WHERE region_id = (SELECT region_id FROM regions WHERE name = ?)
     AND active = 1
     """, (region_name,))
-    
+
     count = cursor.fetchone()["count"]
     return count
 
@@ -79,7 +121,7 @@ def get_logs(region_name):
     WHERE region_id = (SELECT region_id FROM regions WHERE name = ?)
     """, (region_name,))
     return cursor.fetchall()
-    
+
 def get_active_density_event(region_name):
     cursor.execute("""
     SELECT * FROM density_event

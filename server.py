@@ -34,26 +34,26 @@ from ultralytics import YOLO
 from ultralytics import solutions
 from ultralytics.utils.plotting import Annotator, colors
 
-from db import create_region, update_log_event, update_density_event, get_regions, get_logs, get_active_log, get_active_density_event, get_region_count
+from db import create_region, update_log_event, update_density_event, get_regions, get_logs, get_active_log, get_active_density_event, get_region_count, create_stream, get_stream, get_streams
 
 load_dotenv('./.env')
 
 device = torch.device("mps" if torch.mps.is_available() else "cpu")
 
-reid_weights = Path("./weights/osnet_x0_25_msmt17.pt")
-tracker_config = "./strongsort/configs/strongsort.yaml"
-cfg = YamlParser()
-cfg.merge_from_file(tracker_config)
-tracker = StrongSORT(reid_weights,
-                     device,
-                     False,
-                     max_dist=cfg.strongsort.max_dist,
-                     max_iou_dist=cfg.strongsort.max_iou_dist,
-                     max_age=cfg.strongsort.max_age,
-                     max_unmatched_preds=cfg.strongsort.max_unmatched_preds,
-                     n_init=cfg.strongsort.n_init,
-                     nn_budget=cfg.strongsort.nn_budget
-)
+# reid_weights = Path("./weights/osnet_x0_25_msmt17.pt")
+# tracker_config = "./strongsort/configs/strongsort.yaml"
+# cfg = YamlParser()
+# cfg.merge_from_file(tracker_config)
+# tracker = StrongSORT(reid_weights,
+#                      device,
+#                      False,
+#                      max_dist=cfg.strongsort.max_dist,
+#                      max_iou_dist=cfg.strongsort.max_iou_dist,
+#                      max_age=cfg.strongsort.max_age,
+#                      max_unmatched_preds=cfg.strongsort.max_unmatched_preds,
+#                      n_init=cfg.strongsort.n_init,
+#                      nn_budget=cfg.strongsort.nn_budget
+# )
 
 s3_client = boto3.client(
     's3',
@@ -79,9 +79,6 @@ STEP = 1
 
 frames = deque(maxlen=1000)
 
-process_thread = None
-stop_event = threading.Event()
-
 # --- Util
 def upload_to_s3(file_obj, filename):
     try:
@@ -106,54 +103,39 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # --- Routes
 @app.route("/process_stream", methods=["POST"])
 def process_stream():
-    global process_thread, stop_event
-
     data = request.json
     video_stream_url = data.get("video_stream_url", 0)  
     zones = data["zones"]
+    channel = data["stream_name"]
 
     if video_stream_url == "CAMERA":
         video_stream_url = 0
 
-    if process_thread and process_thread.is_alive():
-        return jsonify({"error": "Processing is already running"}), 400
-
     try:
-        stop_event.clear()
-
-        process_thread = threading.Thread(target=process_and_stream, args=(video_stream_url, zones))
-        process_thread.daemon = True
-        process_thread.start()
+        threading.Thread(target=process_and_stream, args=(channel, video_stream_url, zones)).start()
 
         return jsonify({"message": "Processing started"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/stop_process", methods=["POST"])
-def stop_process():
-    global stop_event
+def process_and_stream(channel, video_stream_url, zones):
+    reid_weights = Path("./weights/osnet_x0_25_msmt17.pt")
+    tracker_config = "./strongsort/configs/strongsort.yaml"
+    cfg = YamlParser()
+    cfg.merge_from_file(tracker_config)
+    tracker = StrongSORT(
+        reid_weights,
+        device,
+        False,
+        max_dist=cfg.strongsort.max_dist,
+        max_iou_dist=cfg.strongsort.max_iou_dist,
+        max_age=cfg.strongsort.max_age,
+        max_unmatched_preds=cfg.strongsort.max_unmatched_preds,
+        n_init=cfg.strongsort.n_init,
+        nn_budget=cfg.strongsort.nn_budget
+    )
 
-    if not process_thread or not process_thread.is_alive():
-        return jsonify({"error": "No processing is currently running"}), 400
-
-    stop_event.set()
-    process_thread.join()
-
-    response = {
-        "footfall_summary": {
-            "total_footfall": 0,
-            "zone_footfall": {},
-        },
-        "high_density_times": [],
-        "heatmap_urls": []
-    }
-
-    frames.clear()
-
-    return jsonify({"message": "Processing stopped"}), 200
-
-def process_and_stream(video_stream_url, zones):
-    model = YOLO("yolo11n.pt")
+    model = YOLO("yolo11n.pt", verbose=False)
     # model.to("mps")
 
     classes=[0]
@@ -166,8 +148,12 @@ def process_and_stream(video_stream_url, zones):
     if not videocapture.isOpened():
         raise FileNotFoundError(f"Unable to open video stream: {video_stream_url}")
 
+    create_stream(channel)
+    stream_id = get_stream(channel)["stream_id"]
+
     for zone in zones:
         created_region = create_region(
+            channel,
             zone["zone_id"],
             zone["coordinates"]["x_min"], 
             zone["coordinates"]["y_min"], 
@@ -187,12 +173,12 @@ def process_and_stream(video_stream_url, zones):
     if hasattr(tracker.model, 'warmup'):
         tracker.model.warmup()
 
-    while videocapture.isOpened() and not stop_event.is_set():
+    while videocapture.isOpened():
         success, frame = videocapture.read()
         if not success:
             break
 
-        regions = get_regions()
+        regions = get_regions(channel)
 
         frame_counter += 1 
     
@@ -275,7 +261,9 @@ def process_and_stream(video_stream_url, zones):
         _, buffer = cv2.imencode('.jpg', frame)
         frame_bytes = buffer.tobytes()
         frame_base64 = base64.b64encode(frame_bytes).decode('utf-8')
-        socketio.emit("frame", frame_base64)
+        stream_link = f"stream-{stream_id}"
+        print("Streaming on ", stream_link)
+        socketio.emit(stream_link, frame_base64)
 
         # Response Logic
         for region in regions:
@@ -292,21 +280,16 @@ def process_and_stream(video_stream_url, zones):
         socketio.emit("response", response)
         # socketio.emit("frame", frame_bytes)
 
-        if stop_event.is_set():
-            print("Stopping processing")
-            break
-
-        time.sleep(0.2)
+        time.sleep(0.3)
     
     videocapture.release()
 
 @app.route("/create_zone", methods=["POST"])
 def create_zone():
-    if not process_thread or not process_thread.is_alive():
-        return jsonify({"error": "No processing is currently running"}), 400
     
     data = request.json
     created_region = create_region(
+            data["stream_id"],
             data["zone_id"],
             data["coordinates"]["x_min"], 
             data["coordinates"]["y_min"], 
@@ -363,6 +346,12 @@ def generate_heatmap():
         return jsonify({"heatmap_url": s3_url}), 200
     except Exception as e:
         raise AppError(str(e), status_code=500)
+
+@app.route('/streams', methods=['GET'])
+def fetch_streams():
+    streams = get_streams()
+    print("streams: ", streams)
+    return jsonify({"streams": streams}), 200
 
 # --- Error Handling
 class AppError(Exception):
